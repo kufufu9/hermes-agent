@@ -539,6 +539,7 @@ class AIAgent:
         self.tool_progress_callback = tool_progress_callback
         self.thinking_callback = thinking_callback
         self.reasoning_callback = reasoning_callback
+        self._reasoning_deltas_fired = False  # Set by _fire_reasoning_delta, reset per API call
         self.clarify_callback = clarify_callback
         self.step_callback = step_callback
         self.stream_delta_callback = stream_delta_callback
@@ -3415,6 +3416,7 @@ class AIAgent:
         max_stream_retries = 1
         has_tool_calls = False
         first_delta_fired = False
+        self._reasoning_deltas_fired = False
         for attempt in range(max_stream_retries + 1):
             try:
                 with active_client.responses.stream(**api_kwargs) as stream:
@@ -3691,6 +3693,7 @@ class AIAgent:
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
+        self._reasoning_deltas_fired = True
         cb = self.reasoning_callback
         if cb is not None:
             try:
@@ -3798,6 +3801,9 @@ class AIAgent:
             role = "assistant"
             reasoning_parts: list = []
             usage_obj = None
+            # Reset per-call reasoning tracking so _build_assistant_message
+            # knows whether reasoning was already displayed during streaming.
+            self._reasoning_deltas_fired = False
 
             for chunk in stream:
                 last_chunk_time["t"] = time.time()
@@ -3917,6 +3923,7 @@ class AIAgent:
             works unchanged.
             """
             has_tool_use = False
+            self._reasoning_deltas_fired = False
 
             # Reset stale-stream timer for this attempt
             last_chunk_time["t"] = time.time()
@@ -4630,11 +4637,13 @@ class AIAgent:
             logging.debug(f"Captured reasoning ({len(reasoning_text)} chars): {reasoning_text}")
 
         if reasoning_text and self.reasoning_callback:
-            # Skip callback for <think>-extracted reasoning when streaming is active.
-            # _stream_delta() already displayed <think> blocks during streaming;
-            # firing the callback again would cause duplicate display.
-            # Structured reasoning (from reasoning_content field) always fires.
-            if _from_structured or not self.stream_delta_callback:
+            # Skip callback when reasoning was already displayed during streaming.
+            # Both structured reasoning (_fire_reasoning_delta) and <think> blocks
+            # (_stream_delta tag handling) set flags that prevent re-display here.
+            # Only fire when: (a) no streaming active, or (b) streaming didn't
+            # produce reasoning deltas and reasoning came from structured fields.
+            _already_streamed = getattr(self, '_reasoning_deltas_fired', False)
+            if not _already_streamed and (_from_structured or not self.stream_delta_callback):
                 try:
                     self.reasoning_callback(reasoning_text)
                 except Exception:
